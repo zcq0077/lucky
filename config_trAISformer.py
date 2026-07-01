@@ -22,7 +22,7 @@ import torch
 
 
 class Config():
-    retrain = True
+    retrain = False
     tb_log = False
     device = torch.device("cuda:0")
 #     device = torch.device("cpu")
@@ -65,6 +65,34 @@ class Config():
     sample_mode =  "pos_vicinity" # "pos", "pos_vicinity" or "velo"
     top_k = 10 # int or None 
     r_vicinity = 40 # int
+
+    # Map-conditioned fork/turn prior flags
+    #===================================================
+    use_map_prior = True
+    map_prior_lat_size = 120
+    map_prior_lon_size = 120
+    map_direction_bins = 36
+    map_min_count = 10
+    map_turn_angle_threshold_deg = 25.0
+    map_branch_peak_prob_threshold = 0.12
+    map_branch_min_separation_deg = 35.0
+    map_smooth_iter = 1
+    map_direction_smooth_iter = 1
+    map_use_obstacle_features = False
+    map_obstacle_density_quantile = 0.10
+    map_obstacle_proximity_radius = 5
+    map_prior_channels = 6 if map_use_obstacle_features else 4
+    map_emb_w = 0.10
+    map_emb_pdrop = 0.10
+    map_prior_plot = True
+
+    # Turn intent auxiliary task
+    #===================================================
+    use_turn_intent_head = True
+    turn_intent_loss_w = 0.03
+    turn_straight_threshold_deg = 10.0
+    turn_sharp_threshold_deg = 35.0
+    turn_ignore_first = True
     
     # Blur flags
     #===================================================
@@ -107,8 +135,11 @@ class Config():
     final_tokens = 260e9 # (at what point we reach 10% of original LR)
     num_workers = 4 # for DataLoader
     
+    map_tag = "-map" if use_map_prior else ""
+    turn_tag = "-turn" if use_turn_intent_head else ""
     filename = f"{dataset_name}"\
         + f"-{mode}-{sample_mode}-{top_k}-{r_vicinity}"\
+        + f"{map_tag}{turn_tag}"\
         + f"-blur-{blur}-{blur_learnable}-{blur_n}-{blur_loss_w}"\
         + f"-data_size-{lat_size}-{lon_size}-{sog_size}-{cog_size}"\
         + f"-embd_size-{n_lat_embd}-{n_lon_embd}-{n_sog_embd}-{n_cog_embd}"\

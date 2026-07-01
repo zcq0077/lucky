@@ -109,6 +109,18 @@ if __name__ == "__main__":
     ## Model
     # ===============================
     model = models.TrAISformer(cf, partition_model=None)
+    if getattr(cf, "use_map_prior", False):
+        import map_prior
+
+        prior = map_prior.build_map_prior(Data["train"], cf, savedir=cf.savedir)
+        print(
+            "======= Built map prior: "
+            f"{prior['stats']['n_tracks']} tracks, "
+            f"{prior['stats']['n_points']} points, "
+            f"{prior['stats']['valid_cells']} valid cells, "
+            f"{prior['stats']['feature_channels']} channels"
+        )
+        model.register_map_prior(prior["features"], prior["direction_probs"])
 
     ## Trainer
     # ===============================

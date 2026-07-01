@@ -166,6 +166,30 @@ class TrAISformer(nn.Module):
             
         self.pos_emb = nn.Parameter(torch.zeros(1, config.max_seqlen, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
+
+        self.use_map_prior = getattr(config, "use_map_prior", False)
+        self.map_emb_w = float(getattr(config, "map_emb_w", 0.1))
+        self.map_prior_channels = int(getattr(config, "map_prior_channels", 4))
+        if self.use_map_prior:
+            self.map_encoder = nn.Sequential(
+                nn.Linear(self.map_prior_channels, config.n_embd),
+                nn.GELU(),
+                nn.Dropout(getattr(config, "map_emb_pdrop", 0.0)),
+                nn.Linear(config.n_embd, config.n_embd),
+                nn.LayerNorm(config.n_embd),
+            )
+        else:
+            self.map_encoder = None
+
+        self.use_turn_intent_head = getattr(config, "use_turn_intent_head", False)
+        self.turn_intent_loss_w = float(getattr(config, "turn_intent_loss_w", 0.0))
+        self.turn_straight_threshold_deg = float(getattr(config, "turn_straight_threshold_deg", 10.0))
+        self.turn_sharp_threshold_deg = float(getattr(config, "turn_sharp_threshold_deg", 35.0))
+        self.turn_ignore_first = getattr(config, "turn_ignore_first", True)
+        if self.use_turn_intent_head:
+            self.turn_head = nn.Linear(config.n_embd, 5)
+        else:
+            self.turn_head = None
         
         # transformer
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
@@ -185,6 +209,96 @@ class TrAISformer(nn.Module):
 
     def get_max_seqlen(self):
         return self.max_seqlen
+
+    def register_map_prior(self, features, direction_probs=None):
+        """Register map prior arrays as non-persistent buffers."""
+        features = torch.as_tensor(features, dtype=torch.float32)
+        if features.ndim != 3:
+            raise ValueError("map prior features must have shape [H, W, C]")
+        if features.shape[-1] != self.map_prior_channels:
+            raise ValueError(
+                f"map prior has {features.shape[-1]} channels, "
+                f"but model expects {self.map_prior_channels}"
+            )
+        self.register_buffer("map_prior_features", features, persistent=False)
+        if direction_probs is not None:
+            self.register_buffer(
+                "map_direction_probs",
+                torch.as_tensor(direction_probs, dtype=torch.float32),
+                persistent=False,
+            )
+
+    def query_map_features(self, x_real):
+        if not self.use_map_prior:
+            return None
+        if not hasattr(self, "map_prior_features"):
+            raise RuntimeError("use_map_prior=True but no map prior has been registered")
+
+        features = self.map_prior_features.to(device=x_real.device, dtype=x_real.dtype)
+        H, W, _ = features.shape
+        lat_idx = torch.clamp((x_real[..., 0] * H).long(), 0, H - 1)
+        lon_idx = torch.clamp((x_real[..., 1] * W).long(), 0, W - 1)
+        return features[lat_idx, lon_idx, :]
+
+    def _bearing_deg_torch(self, lat1, lon1, lat2, lon2):
+        lat1 = lat1 * math.pi / 180.0
+        lat2 = lat2 * math.pi / 180.0
+        dlon = (lon2 - lon1) * math.pi / 180.0
+        y = torch.sin(dlon) * torch.cos(lat2)
+        x = torch.cos(lat1) * torch.sin(lat2) - torch.sin(lat1) * torch.cos(lat2) * torch.cos(dlon)
+        return torch.remainder(torch.atan2(y, x) * 180.0 / math.pi + 360.0, 360.0)
+
+    def _signed_circular_diff_deg_torch(self, a, b):
+        return torch.remainder(a - b + 180.0, 360.0) - 180.0
+
+    def make_turn_labels(self, x, input_len, masks=None):
+        """Create turn intent labels for input positions.
+
+        Bearing is measured clockwise from north, so positive heading deltas
+        are right turns and negative heading deltas are left turns.
+        """
+        batchsize, full_len, _ = x.shape
+        labels = torch.zeros((batchsize, input_len), dtype=torch.long, device=x.device)
+        turn_mask = torch.zeros((batchsize, input_len), dtype=torch.bool, device=x.device)
+        if full_len < 3 or input_len <= 1:
+            return labels, turn_mask
+
+        lat = self.lat_min + x[..., 0] * self.lat_range
+        lon = self.lon_min + x[..., 1] * self.lon_range
+        headings = self._bearing_deg_torch(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
+        seg_valid = torch.abs(x[:, 1:, :2] - x[:, :-1, :2]).sum(dim=-1) > 1e-10
+
+        center_count = min(input_len - 1, headings.size(1) - 1)
+        if center_count <= 0:
+            return labels, turn_mask
+
+        delta = self._signed_circular_diff_deg_torch(
+            headings[:, 1:1 + center_count],
+            headings[:, :center_count],
+        )
+        center_labels = torch.zeros_like(delta, dtype=torch.long)
+        straight = self.turn_straight_threshold_deg
+        sharp = self.turn_sharp_threshold_deg
+
+        center_labels[(delta < -straight) & (delta > -sharp)] = 1
+        center_labels[(delta > straight) & (delta < sharp)] = 2
+        center_labels[delta <= -sharp] = 3
+        center_labels[delta >= sharp] = 4
+
+        center_valid = seg_valid[:, 1:1 + center_count] & seg_valid[:, :center_count]
+        if masks is not None:
+            mask_bool = masks > 0
+            center_valid = (
+                center_valid
+                & mask_bool[:, 1:1 + center_count]
+                & mask_bool[:, :center_count]
+            )
+        if self.turn_ignore_first:
+            turn_mask[:, 0] = False
+
+        labels[:, 1:1 + center_count] = center_labels
+        turn_mask[:, 1:1 + center_count] = center_valid
+        return labels, turn_mask
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -309,7 +423,12 @@ class TrAISformer(nn.Module):
         token_embeddings = torch.cat((lat_embeddings, lon_embeddings, sog_embeddings, cog_embeddings),dim=-1)
             
         position_embeddings = self.pos_emb[:, :seqlen, :] # each position maps to a (learnable) vector (1, seqlen, n_embd)
-        fea = self.drop(token_embeddings + position_embeddings)
+        embeddings = token_embeddings + position_embeddings
+        if self.use_map_prior:
+            map_features = self.query_map_features(inputs_real)
+            map_embeddings = self.map_encoder(map_features)
+            embeddings = embeddings + self.map_emb_w * map_embeddings
+        fea = self.drop(embeddings)
         fea = self.blocks(fea)
         fea = self.ln_f(fea) # (bs, seqlen, n_embd)
         logits = self.head(fea) # (bs, seqlen, full_size) or (bs, seqlen, n_embd)
@@ -378,6 +497,18 @@ class TrAISformer(nn.Module):
                 loss = (loss*masks).sum(dim=1)/masks.sum(dim=1)
         
             loss = loss.mean()
+
+            if self.use_turn_intent_head and self.turn_intent_loss_w > 0:
+                turn_logits = self.turn_head(fea)
+                turn_labels, turn_mask = self.make_turn_labels(x, seqlen, masks=masks)
+                turn_loss = F.cross_entropy(
+                    turn_logits.reshape(-1, 5),
+                    turn_labels.reshape(-1),
+                    reduction="none",
+                ).view(batchsize, seqlen)
+                turn_weights = turn_mask.float()
+                turn_loss = (turn_loss * turn_weights).sum() / turn_weights.sum().clamp_min(1.0)
+                loss = loss + self.turn_intent_loss_w * turn_loss
         
         if return_loss_tuple:
             return logits, loss, loss_tuple
