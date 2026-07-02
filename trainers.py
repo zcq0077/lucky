@@ -34,8 +34,6 @@ from torch.utils.data.dataloader import DataLoader
 from torch.nn import functional as F
 import utils
 
-from trAISformer import TB_LOG
-
 logger = logging.getLogger(__name__)
 
 
@@ -123,6 +121,10 @@ class TrainerConfig:
     # checkpoint settings
     ckpt_path = None
     num_workers = 0  # for DataLoader
+    early_stopping = False
+    early_stop_patience = 10
+    early_stop_min_delta = 0.0
+    early_stop_min_epochs = 0
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -154,6 +156,8 @@ class Trainer:
         model, config, aisdls, INIT_SEQLEN, = self.model, self.config, self.aisdls, self.INIT_SEQLEN
         raw_model = model.module if hasattr(self.model, "module") else model
         optimizer = raw_model.configure_optimizers(config)
+        tb_writer = getattr(config, "tb_writer", None)
+        use_tb = getattr(config, "tb_log", False) and tb_writer is not None
         if model.mode in ("gridcont_gridsin", "gridcont_gridsigmoid", "gridcont2_gridsigmoid",):
             return_loss_tuple = True
         else:
@@ -225,21 +229,21 @@ class Trainer:
                     pbar.set_description(f"epoch {epoch + 1} iter {it}: loss {loss.item():.5f}. lr {lr:e}")
 
                     # tb logging
-                    if TB_LOG:
-                        tb.add_scalar("loss",
-                                      loss.item(),
-                                      epoch * n_batches + it)
-                        tb.add_scalar("lr",
-                                      lr,
-                                      epoch * n_batches + it)
+                    if use_tb:
+                        tb_writer.add_scalar("loss",
+                                             loss.item(),
+                                             epoch * n_batches + it)
+                        tb_writer.add_scalar("lr",
+                                             lr,
+                                             epoch * n_batches + it)
 
                         for name, params in model.head.named_parameters():
-                            tb.add_histogram(f"head.{name}", params, epoch * n_batches + it)
-                            tb.add_histogram(f"head.{name}.grad", params.grad, epoch * n_batches + it)
+                            tb_writer.add_histogram(f"head.{name}", params, epoch * n_batches + it)
+                            tb_writer.add_histogram(f"head.{name}.grad", params.grad, epoch * n_batches + it)
                         if model.mode in ("gridcont_real",):
                             for name, params in model.res_pred.named_parameters():
-                                tb.add_histogram(f"res_pred.{name}", params, epoch * n_batches + it)
-                                tb.add_histogram(f"res_pred.{name}.grad", params.grad, epoch * n_batches + it)
+                                tb_writer.add_histogram(f"res_pred.{name}", params, epoch * n_batches + it)
+                                tb_writer.add_histogram(f"res_pred.{name}.grad", params.grad, epoch * n_batches + it)
 
             if is_train:
                 if return_loss_tuple:
@@ -261,6 +265,11 @@ class Trainer:
         best_loss = float('inf')
         self.tokens = 0  # counter used for learning rate decay
         best_epoch = 0
+        epochs_without_improve = 0
+        early_stopping = getattr(config, "early_stopping", False)
+        early_stop_patience = int(getattr(config, "early_stop_patience", 10))
+        early_stop_min_delta = float(getattr(config, "early_stop_min_delta", 0.0))
+        early_stop_min_epochs = int(getattr(config, "early_stop_min_epochs", 0))
 
         for epoch in range(config.max_epochs):
 
@@ -268,12 +277,34 @@ class Trainer:
             if self.test_dataset is not None:
                 test_loss = run_epoch('Valid', epoch=epoch)
 
-            # supports early stopping based on the test loss, or just save always if no test set is provided
-            good_model = self.test_dataset is None or test_loss < best_loss
-            if self.config.ckpt_path is not None and good_model:
-                best_loss = test_loss
+            # supports early stopping based on the validation loss, or just save always if no validation set is provided
+            good_model = self.test_dataset is None or test_loss < best_loss - early_stop_min_delta
+            if good_model:
+                if self.test_dataset is not None:
+                    best_loss = test_loss
                 best_epoch = epoch
-                self.save_checkpoint(best_epoch + 1)
+                epochs_without_improve = 0
+                if self.config.ckpt_path is not None:
+                    self.save_checkpoint(best_epoch + 1)
+            elif self.test_dataset is not None:
+                epochs_without_improve += 1
+                logging.info(
+                    f"Early stopping monitor: {epochs_without_improve}/"
+                    f"{early_stop_patience} epochs without improvement. "
+                    f"Best epoch {best_epoch + 1:03d}, best valid loss {best_loss:.5f}."
+                )
+
+            if (
+                early_stopping
+                and self.test_dataset is not None
+                and epoch + 1 >= early_stop_min_epochs
+                and epochs_without_improve >= early_stop_patience
+            ):
+                logging.info(
+                    f"Early stopping at epoch {epoch + 1:03d}. "
+                    f"Best epoch {best_epoch + 1:03d}, best valid loss {best_loss:.5f}."
+                )
+                break
 
             ## SAMPLE AND PLOT
             # ==========================================================================================

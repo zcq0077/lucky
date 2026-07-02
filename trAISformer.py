@@ -48,10 +48,177 @@ if TB_LOG:
     from torch.utils.tensorboard import SummaryWriter
 
     tb = SummaryWriter()
+    cf.tb_writer = tb
+else:
+    cf.tb_writer = None
 
 # make deterministic
 utils.set_seed(42)
 torch.pi = torch.acos(torch.zeros(1)).item() * 2
+
+
+def _to_lon_lat_degrees(seqs, model):
+    """Convert normalized [lat, lon, ...] arrays to lon/lat degrees."""
+    lat = model.lat_min + seqs[..., 0] * model.lat_range
+    lon = model.lon_min + seqs[..., 1] * model.lon_range
+    return lon, lat
+
+
+def _mean_future_haversine_km(pred, truth, model, init_seqlen, true_len):
+    """Mean future distance between one sampled prediction and truth."""
+    start = init_seqlen
+    end = min(true_len, pred.shape[0], truth.shape[0])
+    if end <= start:
+        return float("inf")
+
+    pred_lat = model.lat_min + pred[start:end, 0] * model.lat_range
+    pred_lon = model.lon_min + pred[start:end, 1] * model.lon_range
+    true_lat = model.lat_min + truth[start:end, 0] * model.lat_range
+    true_lon = model.lon_min + truth[start:end, 1] * model.lon_range
+
+    pred_lat = np.radians(pred_lat)
+    pred_lon = np.radians(pred_lon)
+    true_lat = np.radians(true_lat)
+    true_lon = np.radians(true_lon)
+
+    dlat = pred_lat - true_lat
+    dlon = pred_lon - true_lon
+    a = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(true_lat) * np.cos(pred_lat) * np.sin(dlon / 2.0) ** 2
+    )
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    return float(np.mean(6371.0 * c))
+
+
+def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seqlen, savedir):
+    """Plot history, ground truth, and sampled predictions for test trajectories."""
+    if not getattr(cf, "test_visualize", True):
+        return
+
+    n_examples = int(getattr(cf, "test_visualize_n", 10))
+    n_pred_samples = int(getattr(cf, "test_visualize_pred_samples", 4))
+    rng = np.random.default_rng(int(getattr(cf, "test_visualize_seed", 42)))
+
+    seqlens_all = np.array([
+        min(len(v["traj"]), test_dataset.max_seqlen)
+        for v in test_dataset.l_data
+    ])
+    eligible = np.flatnonzero(seqlens_all > init_seqlen + 1)
+    if eligible.size == 0:
+        print("======= No valid test trajectories for visualization.")
+        return
+
+    n_examples = min(n_examples, eligible.size)
+    selected = rng.choice(eligible, size=n_examples, replace=False)
+
+    seqs, masks, seqlens, mmsis = [], [], [], []
+    for idx in selected:
+        seq, mask, seqlen, mmsi, _ = test_dataset[int(idx)]
+        seqs.append(seq)
+        masks.append(mask)
+        seqlens.append(int(seqlen.item()))
+        mmsis.append(int(mmsi.item()))
+
+    seqs = torch.stack(seqs, dim=0)
+    seqs_init = seqs[:, :init_seqlen, :].to(cf.device)
+    steps = max_seqlen - init_seqlen
+
+    pred_samples = []
+    model.eval()
+    with torch.no_grad():
+        for _ in range(max(1, n_pred_samples)):
+            preds = trainers.sample(
+                model,
+                seqs_init,
+                steps,
+                temperature=1.0,
+                sample=True,
+                sample_mode=cf.sample_mode,
+                r_vicinity=cf.r_vicinity,
+                top_k=cf.top_k,
+            )
+            pred_samples.append(preds.detach().cpu().numpy())
+
+    seqs_np = seqs.detach().cpu().numpy()
+    ncols = 5
+    nrows = int(math.ceil(n_examples / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.6 * nrows), dpi=160)
+    axes = np.asarray(axes).reshape(-1)
+
+    for ax_idx, ax in enumerate(axes):
+        if ax_idx >= n_examples:
+            ax.axis("off")
+            continue
+
+        true_len = min(seqlens[ax_idx], max_seqlen)
+        hist_end = min(init_seqlen, true_len)
+        seq = seqs_np[ax_idx]
+        lon_true, lat_true = _to_lon_lat_degrees(seq, model)
+
+        ax.plot(
+            lon_true[:hist_end],
+            lat_true[:hist_end],
+            color="tab:blue",
+            linewidth=2.0,
+            marker="o",
+            markersize=2.5,
+            label="History" if ax_idx == 0 else None,
+        )
+        if true_len > hist_end:
+            truth_start = max(hist_end - 1, 0)
+            ax.plot(
+                lon_true[truth_start:true_len],
+                lat_true[truth_start:true_len],
+                color="tab:green",
+                linewidth=2.0,
+                marker=".",
+                markersize=3.0,
+                label="Ground truth" if ax_idx == 0 else None,
+            )
+
+        sample_errors = [
+            _mean_future_haversine_km(
+                pred_np[ax_idx],
+                seq,
+                model,
+                init_seqlen,
+                true_len,
+            )
+            for pred_np in pred_samples
+        ]
+        best_sample_idx = int(np.argmin(sample_errors))
+
+        pred_start = max(init_seqlen - 1, 0)
+        for sample_idx, pred_np in enumerate(pred_samples):
+            pred = pred_np[ax_idx]
+            lon_pred, lat_pred = _to_lon_lat_degrees(pred, model)
+            is_best = sample_idx == best_sample_idx
+            ax.plot(
+                lon_pred[pred_start:max_seqlen],
+                lat_pred[pred_start:max_seqlen],
+                color="tab:red",
+                linewidth=2.4 if is_best else 1.0,
+                alpha=0.95 if is_best else 0.18,
+                label="Best prediction" if ax_idx == 0 and is_best else None,
+            )
+
+        ax.set_title(f"Test #{int(selected[ax_idx])}  MMSI {mmsis[ax_idx]}", fontsize=9)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.grid(True, alpha=0.25)
+        ax.set_aspect("equal", adjustable="datalim")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+
+    out_path = os.path.join(savedir, "test_trajectory_examples.png")
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"======= Saved test trajectory visualization: {out_path}")
+
 
 if __name__ == "__main__":
 
@@ -204,5 +371,17 @@ if __name__ == "__main__":
     plt.ylim([0, 20])
     # plt.ylim([0,pred_errors.max()+0.5])
     plt.savefig(cf.savedir + "prediction_error.png")
+    plt.close()
+
+    ## Test trajectory visualization
+    # ===============================
+    plot_test_trajectory_examples(
+        model,
+        aisdatasets["test"],
+        cf,
+        init_seqlen,
+        max_seqlen,
+        cf.savedir,
+    )
 
     # Yeah, done!!!

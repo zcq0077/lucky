@@ -22,7 +22,7 @@ import torch
 
 
 class Config():
-    retrain = False
+    retrain = True
     tb_log = False
     device = torch.device("cuda:0")
 #     device = torch.device("cpu")
@@ -30,6 +30,20 @@ class Config():
     max_epochs = 50
     batch_size = 32
     n_samples = 16
+
+    # Early stopping flags
+    #===================================================
+    early_stopping = True
+    early_stop_patience = 8
+    early_stop_min_delta = 1e-4
+    early_stop_min_epochs = 10
+
+    # Test-set trajectory visualization flags
+    #===================================================
+    test_visualize = True
+    test_visualize_n = 10
+    test_visualize_pred_samples = 4
+    test_visualize_seed = 42
     
     init_seqlen = 18
     max_seqlen = 120
