@@ -22,7 +22,7 @@ import torch
 
 
 class Config():
-    retrain = True
+    retrain = False
     tb_log = False
     device = torch.device("cuda:0")
 #     device = torch.device("cpu")
@@ -42,7 +42,7 @@ class Config():
     #===================================================
     test_visualize = True
     test_visualize_n = 10
-    test_visualize_pred_samples = 4
+    test_visualize_pred_samples = n_samples
     test_visualize_seed = 42
     
     init_seqlen = 18

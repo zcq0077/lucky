@@ -97,7 +97,7 @@ def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seql
         return
 
     n_examples = int(getattr(cf, "test_visualize_n", 10))
-    n_pred_samples = int(getattr(cf, "test_visualize_pred_samples", 4))
+    n_pred_samples = int(getattr(cf, "test_visualize_pred_samples", getattr(cf, "n_samples", 16)))
     rng = np.random.default_rng(int(getattr(cf, "test_visualize_seed", 42)))
 
     seqlens_all = np.array([
