@@ -91,6 +91,29 @@ def _mean_future_haversine_km(pred, truth, model, init_seqlen, true_len):
     return float(np.mean(6371.0 * c))
 
 
+def load_qwen_cache(cf, phase, n_items):
+    cache_path = os.path.join(
+        cf.qwen_cache_dir,
+        f"{cf.dataset_name}_{phase}_qwen_vecs.npz",
+    )
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Qwen semantic cache not found: {cache_path}\n"
+            "Generate it first, for example:\n"
+            "python generate_qwen_embedding_cache.py --phase all --device cuda --overwrite"
+        )
+    cache = np.load(cache_path, allow_pickle=True)
+    vectors = cache["qwen_vecs"].astype(np.float32)
+    masks = cache["qwen_mask"].astype(np.float32)
+    if len(vectors) != n_items:
+        raise ValueError(
+            f"Qwen cache length mismatch for {phase}: cache has {len(vectors)}, "
+            f"dataset has {n_items}. Regenerate the cache after data/config changes."
+        )
+    print(f"======= Loaded Qwen semantic cache for {phase}: {cache_path} {vectors.shape}")
+    return vectors, masks
+
+
 def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seqlen, savedir):
     """Plot history, ground truth, and sampled predictions for test trajectories."""
     if not getattr(cf, "test_visualize", True):
@@ -113,15 +136,26 @@ def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seql
     selected = rng.choice(eligible, size=n_examples, replace=False)
 
     seqs, masks, seqlens, mmsis = [], [], [], []
+    qwen_vecs, qwen_masks = [], []
     for idx in selected:
-        seq, mask, seqlen, mmsi, _ = test_dataset[int(idx)]
+        item = test_dataset[int(idx)]
+        seq, mask, seqlen, mmsi, _, qwen_vec, qwen_mask = trainers.unpack_batch(item)
         seqs.append(seq)
         masks.append(mask)
         seqlens.append(int(seqlen.item()))
         mmsis.append(int(mmsi.item()))
+        if qwen_vec is not None:
+            qwen_vecs.append(qwen_vec)
+            qwen_masks.append(qwen_mask)
 
     seqs = torch.stack(seqs, dim=0)
     seqs_init = seqs[:, :init_seqlen, :].to(cf.device)
+    if qwen_vecs:
+        qwen_vecs = torch.stack(qwen_vecs, dim=0).to(cf.device)
+        qwen_masks = torch.stack(qwen_masks, dim=0).to(cf.device)
+    else:
+        qwen_vecs = None
+        qwen_masks = None
     steps = max_seqlen - init_seqlen
 
     pred_samples = []
@@ -137,6 +171,8 @@ def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seql
                 sample_mode=cf.sample_mode,
                 r_vicinity=cf.r_vicinity,
                 top_k=cf.top_k,
+                qwen_vec=qwen_vecs,
+                qwen_mask=qwen_masks,
             )
             pred_samples.append(preds.detach().cpu().numpy())
 
@@ -239,6 +275,12 @@ if __name__ == "__main__":
     moving_threshold = 0.05
     l_pkl_filenames = [cf.trainset_name, cf.validset_name, cf.testset_name]
     Data, aisdatasets, aisdls = {}, {}, {}
+    qwen_cache = {}
+    if getattr(cf, "use_qwen_semantic_encoder", False) and not getattr(cf, "qwen_use_cache", True):
+        raise NotImplementedError(
+            "True online Qwen encoding is not enabled in the lightweight path. "
+            "Use qwen_use_cache=True and run generate_qwen_embedding_cache.py first."
+        )
     for phase, filename in zip(("train", "valid", "test"), l_pkl_filenames):
         datapath = os.path.join(cf.datadir, filename)
         print(f"Loading {datapath}...")
@@ -253,16 +295,27 @@ if __name__ == "__main__":
         Data[phase] = [x for x in l_pred_errors if not np.isnan(x["traj"]).any() and len(x["traj"]) > cf.min_seqlen]
         print(len(l_pred_errors), len(Data[phase]))
         print(f"Length: {len(Data[phase])}")
+        if getattr(cf, "use_qwen_semantic_encoder", False):
+            qwen_vectors, qwen_masks = load_qwen_cache(cf, phase, len(Data[phase]))
+            qwen_cache[phase] = (qwen_vectors, qwen_masks)
+            cf.qwen_hidden_size = int(qwen_vectors.shape[1])
+        else:
+            qwen_cache[phase] = (None, None)
         print("Creating pytorch dataset...")
         # Latter in this scipt, we will use inputs = x[:-1], targets = x[1:], hence
         # max_seqlen = cf.max_seqlen + 1.
+        qwen_vectors, qwen_masks = qwen_cache[phase]
         if cf.mode in ("pos_grad", "grad"):
             aisdatasets[phase] = datasets.AISDataset_grad(Data[phase],
                                                           max_seqlen=cf.max_seqlen + 1,
+                                                          qwen_vectors=qwen_vectors,
+                                                          qwen_mask=qwen_masks,
                                                           device=cf.device)
         else:
             aisdatasets[phase] = datasets.AISDataset(Data[phase],
                                                      max_seqlen=cf.max_seqlen + 1,
+                                                     qwen_vectors=qwen_vectors,
+                                                     qwen_mask=qwen_masks,
                                                      device=cf.device)
         if phase == "test":
             shuffle = False
@@ -312,9 +365,13 @@ if __name__ == "__main__":
     l_min_errors, l_mean_errors, l_masks = [], [], []
     pbar = tqdm(enumerate(aisdls["test"]), total=len(aisdls["test"]))
     with torch.no_grad():
-        for it, (seqs, masks, seqlens, mmsis, time_starts) in pbar:
+        for it, batch in pbar:
+            seqs, masks, seqlens, mmsis, time_starts, qwen_vecs, qwen_masks = trainers.unpack_batch(batch)
             seqs_init = seqs[:, :init_seqlen, :].to(cf.device)
             masks = masks[:, :max_seqlen].to(cf.device)
+            if qwen_vecs is not None:
+                qwen_vecs = qwen_vecs.to(cf.device)
+                qwen_masks = qwen_masks.to(cf.device)
             batchsize = seqs.shape[0]
             error_ens = torch.zeros((batchsize, max_seqlen - cf.init_seqlen, cf.n_samples)).to(cf.device)
             for i_sample in range(cf.n_samples):
@@ -325,7 +382,9 @@ if __name__ == "__main__":
                                         sample=True,
                                         sample_mode=cf.sample_mode,
                                         r_vicinity=cf.r_vicinity,
-                                        top_k=cf.top_k)
+                                        top_k=cf.top_k,
+                                        qwen_vec=qwen_vecs,
+                                        qwen_mask=qwen_masks)
                 inputs = seqs[:, :max_seqlen, :].to(cf.device)
                 input_coords = (inputs * v_ranges + v_roi_min) * torch.pi / 180
                 pred_coords = (preds * v_ranges + v_roi_min) * torch.pi / 180

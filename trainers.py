@@ -45,7 +45,9 @@ def sample(model,
            sample=False,
            sample_mode="pos_vicinity",
            r_vicinity=20,
-           top_k=None):
+           top_k=None,
+           qwen_vec=None,
+           qwen_mask=None):
     """
     Take a conditoning sequence of AIS observations seq and predict the next observation,
     feed the predictions back into the model each time. 
@@ -56,7 +58,7 @@ def sample(model,
         seqs_cond = seqs if seqs.size(1) <= max_seqlen else seqs[:, -max_seqlen:]  # crop context if needed
 
         # logits.shape: (batch_size, seq_len, data_size)
-        logits, _ = model(seqs_cond)
+        logits, _ = model(seqs_cond, qwen_vec=qwen_vec, qwen_mask=qwen_mask)
         d2inf_pred = torch.zeros((logits.shape[0], 4)).to(seqs.device) + 0.5
 
         # pluck the logits at the final step and scale by temperature
@@ -104,6 +106,16 @@ def sample(model,
         seqs = torch.cat((seqs, x_sample.unsqueeze(1)), dim=1)
 
     return seqs
+
+
+def unpack_batch(batch):
+    if len(batch) == 5:
+        seqs, masks, seqlens, mmsis, time_starts = batch
+        return seqs, masks, seqlens, mmsis, time_starts, None, None
+    if len(batch) == 7:
+        seqs, masks, seqlens, mmsis, time_starts, qwen_vecs, qwen_masks = batch
+        return seqs, masks, seqlens, mmsis, time_starts, qwen_vecs, qwen_masks
+    raise ValueError(f"Unexpected batch size: {len(batch)}")
 
 
 class TrainerConfig:
@@ -175,11 +187,15 @@ class Trainer:
             n_batches = len(loader)
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
             d_loss, d_reg_loss, d_n = 0, 0, 0
-            for it, (seqs, masks, seqlens, mmsis, time_starts) in pbar:
+            for it, batch in pbar:
+                seqs, masks, seqlens, mmsis, time_starts, qwen_vecs, qwen_masks = unpack_batch(batch)
 
                 # place data on the correct device
                 seqs = seqs.to(self.device)
                 masks = masks[:, 1:].to(self.device)
+                if qwen_vecs is not None:
+                    qwen_vecs = qwen_vecs.to(self.device)
+                    qwen_masks = qwen_masks.to(self.device)
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
@@ -187,9 +203,17 @@ class Trainer:
                         logits, loss, loss_tuple = model(seqs,
                                                          masks=masks,
                                                          with_targets=True,
-                                                         return_loss_tuple=return_loss_tuple)
+                                                         return_loss_tuple=return_loss_tuple,
+                                                         qwen_vec=qwen_vecs,
+                                                         qwen_mask=qwen_masks)
                     else:
-                        logits, loss = model(seqs, masks=masks, with_targets=True)
+                        logits, loss = model(
+                            seqs,
+                            masks=masks,
+                            with_targets=True,
+                            qwen_vec=qwen_vecs,
+                            qwen_mask=qwen_masks,
+                        )
                     loss = loss.mean()  # collapse all losses if they are scattered on multiple gpus
                     losses.append(loss.item())
 
@@ -310,10 +334,13 @@ class Trainer:
             # ==========================================================================================
             # ==========================================================================================
             raw_model = model.module if hasattr(self.model, "module") else model
-            seqs, masks, seqlens, mmsis, time_starts = next(iter(aisdls["test"]))
+            seqs, masks, seqlens, mmsis, time_starts, qwen_vecs, qwen_masks = unpack_batch(next(iter(aisdls["test"])))
             n_plots = 7
             init_seqlen = INIT_SEQLEN
             seqs_init = seqs[:n_plots, :init_seqlen, :].to(self.device)
+            if qwen_vecs is not None:
+                qwen_vecs = qwen_vecs[:n_plots].to(self.device)
+                qwen_masks = qwen_masks[:n_plots].to(self.device)
             preds = sample(raw_model,
                            seqs_init,
                            96 - init_seqlen,
@@ -321,7 +348,9 @@ class Trainer:
                            sample=True,
                            sample_mode=self.config.sample_mode,
                            r_vicinity=self.config.r_vicinity,
-                           top_k=self.config.top_k)
+                           top_k=self.config.top_k,
+                           qwen_vec=qwen_vecs,
+                           qwen_mask=qwen_masks)
 
             img_path = os.path.join(self.savedir, f'epoch_{epoch + 1:03d}.jpg')
             plt.figure(figsize=(9, 6), dpi=150)

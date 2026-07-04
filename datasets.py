@@ -29,6 +29,8 @@ class AISDataset(Dataset):
     def __init__(self, 
                  l_data, 
                  max_seqlen=96,
+                 qwen_vectors=None,
+                 qwen_mask=None,
                  dtype=torch.float32,
                  device=torch.device("cpu")):
         """
@@ -45,6 +47,18 @@ class AISDataset(Dataset):
         self.device = device
         
         self.l_data = l_data 
+        self.qwen_vectors = None
+        self.qwen_mask = None
+        if qwen_vectors is not None:
+            if len(qwen_vectors) != len(l_data):
+                raise ValueError("qwen_vectors must have the same length as l_data")
+            self.qwen_vectors = np.asarray(qwen_vectors, dtype=np.float32)
+            if qwen_mask is None:
+                self.qwen_mask = np.ones((len(l_data),), dtype=np.float32)
+            else:
+                if len(qwen_mask) != len(l_data):
+                    raise ValueError("qwen_mask must have the same length as l_data")
+                self.qwen_mask = np.asarray(qwen_mask, dtype=np.float32)
 
     def __len__(self):
         return len(self.l_data)
@@ -75,7 +89,12 @@ class AISDataset(Dataset):
         seqlen = torch.tensor(seqlen, dtype=torch.int)
         mmsi =  torch.tensor(V["mmsi"], dtype=torch.int)
         time_start = torch.tensor(V["traj"][0,4], dtype=torch.int)
-        
+
+        if self.qwen_vectors is not None:
+            qwen_vec = torch.tensor(self.qwen_vectors[idx], dtype=torch.float32)
+            qwen_mask = torch.tensor(self.qwen_mask[idx], dtype=torch.float32)
+            return seq, mask, seqlen, mmsi, time_start, qwen_vec, qwen_mask
+
         return seq , mask, seqlen, mmsi, time_start
     
 class AISDataset_grad(Dataset):
@@ -87,6 +106,8 @@ class AISDataset_grad(Dataset):
                  dlat_max=0.04,
                  dlon_max=0.04,
                  max_seqlen=96,
+                 qwen_vectors=None,
+                 qwen_mask=None,
                  dtype=torch.float32,
                  device=torch.device("cpu")):
         """
@@ -108,6 +129,18 @@ class AISDataset_grad(Dataset):
         self.device = device
         
         self.l_data = l_data 
+        self.qwen_vectors = None
+        self.qwen_mask = None
+        if qwen_vectors is not None:
+            if len(qwen_vectors) != len(l_data):
+                raise ValueError("qwen_vectors must have the same length as l_data")
+            self.qwen_vectors = np.asarray(qwen_vectors, dtype=np.float32)
+            if qwen_mask is None:
+                self.qwen_mask = np.ones((len(l_data),), dtype=np.float32)
+            else:
+                if len(qwen_mask) != len(l_data):
+                    raise ValueError("qwen_mask must have the same length as l_data")
+                self.qwen_mask = np.asarray(qwen_mask, dtype=np.float32)
 
     def __len__(self):
         return len(self.l_data)
@@ -146,5 +179,10 @@ class AISDataset_grad(Dataset):
         seqlen = torch.tensor(seqlen, dtype=torch.int)
         mmsi =  torch.tensor(V["mmsi"], dtype=torch.int)
         time_start = torch.tensor(V["traj"][0,4], dtype=torch.int)
-        
+
+        if self.qwen_vectors is not None:
+            qwen_vec = torch.tensor(self.qwen_vectors[idx], dtype=torch.float32)
+            qwen_mask = torch.tensor(self.qwen_mask[idx], dtype=torch.float32)
+            return seq, mask, seqlen, mmsi, time_start, qwen_vec, qwen_mask
+
         return seq , mask, seqlen, mmsi, time_start

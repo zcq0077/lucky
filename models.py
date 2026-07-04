@@ -190,6 +190,37 @@ class TrAISformer(nn.Module):
             self.turn_head = nn.Linear(config.n_embd, 5)
         else:
             self.turn_head = None
+
+        self.use_qwen_semantic_encoder = getattr(config, "use_qwen_semantic_encoder", False)
+        self.qwen_hidden_size = int(getattr(config, "qwen_hidden_size", 2560))
+        self.qwen_fusion = getattr(config, "qwen_fusion", "both")
+        self.qwen_emb_w = float(getattr(config, "qwen_emb_w", 0.05))
+        self.qwen_bias_w = float(getattr(config, "qwen_bias_w", 0.05))
+        self.qwen_logit_bias_radius = float(getattr(config, "qwen_logit_bias_radius", getattr(config, "r_vicinity", 40)))
+        if self.use_qwen_semantic_encoder:
+            self.qwen_projector = nn.Sequential(
+                nn.LayerNorm(self.qwen_hidden_size),
+                nn.Linear(self.qwen_hidden_size, config.n_embd),
+                nn.GELU(),
+                nn.Dropout(getattr(config, "qwen_emb_pdrop", 0.0)),
+                nn.Linear(config.n_embd, config.n_embd),
+                nn.LayerNorm(config.n_embd),
+            )
+            self.qwen_gate = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd),
+                nn.Sigmoid(),
+            )
+            self.captain_selector = nn.Sequential(
+                nn.LayerNorm(self.qwen_hidden_size),
+                nn.Linear(self.qwen_hidden_size, max(64, config.n_embd // 4)),
+                nn.GELU(),
+                nn.Linear(max(64, config.n_embd // 4), 5),
+                nn.Tanh(),
+            )
+        else:
+            self.qwen_projector = None
+            self.qwen_gate = None
+            self.captain_selector = None
         
         # transformer
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
@@ -300,6 +331,72 @@ class TrAISformer(nn.Module):
         turn_mask[:, 1:1 + center_count] = center_valid
         return labels, turn_mask
 
+    def _prepare_qwen(self, qwen_vec, qwen_mask=None):
+        if not self.use_qwen_semantic_encoder:
+            return None, None
+        if qwen_vec is None:
+            return None, None
+        qwen_vec = qwen_vec.to(dtype=self.pos_emb.dtype, device=self.pos_emb.device)
+        if qwen_mask is None:
+            qwen_mask = torch.ones(qwen_vec.size(0), dtype=qwen_vec.dtype, device=qwen_vec.device)
+        else:
+            qwen_mask = qwen_mask.to(dtype=qwen_vec.dtype, device=qwen_vec.device)
+        qwen_mask = qwen_mask.view(-1, 1)
+        return qwen_vec, qwen_mask
+
+    def _qwen_embedding(self, qwen_vec, qwen_mask):
+        if qwen_vec is None or self.qwen_projector is None:
+            return None
+        qwen_emb = self.qwen_projector(qwen_vec) * qwen_mask
+        if self.qwen_fusion in ("gated_add", "both"):
+            qwen_emb = self.qwen_gate(qwen_emb) * qwen_emb
+        return qwen_emb
+
+    def _apply_qwen_logit_bias(self, logits, inputs_real, qwen_vec, qwen_mask):
+        if (
+            qwen_vec is None
+            or self.captain_selector is None
+            or self.qwen_bias_w <= 0
+            or self.qwen_fusion not in ("logit_bias", "both")
+            or logits.size(-1) != self.full_size
+        ):
+            return logits
+
+        batchsize, seqlen, _ = inputs_real.shape
+        direction_scores = self.captain_selector(qwen_vec) * qwen_mask
+        direction_deltas = torch.tensor(
+            [0.0, -25.0, 25.0, -70.0, 70.0],
+            dtype=inputs_real.dtype,
+            device=inputs_real.device,
+        )
+
+        heading = torch.remainder(inputs_real[..., 3] * 360.0, 360.0)
+        bearings = torch.remainder(heading.unsqueeze(-1) + direction_deltas.view(1, 1, 5), 360.0)
+        bearings_rad = bearings * math.pi / 180.0
+        desired_lat = torch.cos(bearings_rad)
+        desired_lon = torch.sin(bearings_rad)
+
+        radius = max(self.qwen_logit_bias_radius, 1.0)
+        lat_values = torch.arange(self.lat_size, dtype=inputs_real.dtype, device=inputs_real.device)
+        lon_values = torch.arange(self.lon_size, dtype=inputs_real.dtype, device=inputs_real.device)
+        cur_lat = inputs_real[..., 0] * (self.lat_size - 1)
+        cur_lon = inputs_real[..., 1] * (self.lon_size - 1)
+        lat_delta = torch.clamp((lat_values.view(1, 1, -1) - cur_lat.unsqueeze(-1)) / radius, -1.0, 1.0)
+        lon_delta = torch.clamp((lon_values.view(1, 1, -1) - cur_lon.unsqueeze(-1)) / radius, -1.0, 1.0)
+
+        score = direction_scores.view(batchsize, 1, 5)
+        lat_bias = torch.sum(score.unsqueeze(-1) * desired_lat.unsqueeze(-1) * lat_delta.unsqueeze(2), dim=2)
+        lon_bias = torch.sum(score.unsqueeze(-1) * desired_lon.unsqueeze(-1) * lon_delta.unsqueeze(2), dim=2)
+
+        lat_logits, lon_logits, sog_logits, cog_logits = torch.split(
+            logits,
+            (self.lat_size, self.lon_size, self.sog_size, self.cog_size),
+            dim=-1,
+        )
+        lat_logits = lat_logits + self.qwen_bias_w * lat_bias
+        lon_logits = lon_logits + self.qwen_bias_w * lon_bias
+        return torch.cat((lat_logits, lon_logits, sog_logits, cog_logits), dim=-1)
+
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
@@ -382,7 +479,7 @@ class TrAISformer(nn.Module):
             return idxs, idxs_uniform
     
     
-    def forward(self, x, masks = None, with_targets=False, return_loss_tuple=False):
+    def forward(self, x, masks = None, with_targets=False, return_loss_tuple=False, qwen_vec=None, qwen_mask=None):
         """
         Args:
             x: a Tensor of size (batchsize, seqlen, 4). x has been truncated 
@@ -415,6 +512,8 @@ class TrAISformer(nn.Module):
         batchsize, seqlen, _ = inputs.size()
         assert seqlen <= self.max_seqlen, "Cannot forward, model block size is exhausted."
 
+        qwen_vec, qwen_mask = self._prepare_qwen(qwen_vec, qwen_mask)
+
         # forward the GPT model
         lat_embeddings = self.lat_emb(inputs[:,:,0]) # (bs, seqlen, lat_size)
         lon_embeddings = self.lon_emb(inputs[:,:,1]) 
@@ -428,10 +527,14 @@ class TrAISformer(nn.Module):
             map_features = self.query_map_features(inputs_real)
             map_embeddings = self.map_encoder(map_features)
             embeddings = embeddings + self.map_emb_w * map_embeddings
+        qwen_emb = self._qwen_embedding(qwen_vec, qwen_mask)
+        if qwen_emb is not None and self.qwen_fusion in ("add", "gated_add", "both"):
+            embeddings = embeddings + self.qwen_emb_w * qwen_emb.unsqueeze(1)
         fea = self.drop(embeddings)
         fea = self.blocks(fea)
         fea = self.ln_f(fea) # (bs, seqlen, n_embd)
         logits = self.head(fea) # (bs, seqlen, full_size) or (bs, seqlen, n_embd)
+        logits = self._apply_qwen_logit_bias(logits, inputs_real, qwen_vec, qwen_mask)
         
         lat_logits, lon_logits, sog_logits, cog_logits =\
             torch.split(logits, (self.lat_size, self.lon_size, self.sog_size, self.cog_size), dim=-1)
