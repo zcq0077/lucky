@@ -44,6 +44,7 @@ def set_seed(seed):
 def new_log(logdir,filename):
     """Defines logging format.
     """
+    os.makedirs(logdir, exist_ok=True)
     filename = os.path.join(logdir,
                             datetime.datetime.now().strftime("log_%Y-%m-%d-%H-%M-%S_"+socket.gethostname()+"_"+filename+".log"))
     logging.basicConfig(level=logging.INFO,

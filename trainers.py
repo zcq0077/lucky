@@ -37,6 +37,276 @@ import utils
 logger = logging.getLogger(__name__)
 
 
+def _dynamic_qwen_complex_mask(seqs, prior, turn_threshold, branch_threshold, entropy_threshold):
+    """Return which rollout samples are currently in complex map cells."""
+    batchsize = seqs.size(0)
+    if prior is None or "features" not in prior:
+        return torch.zeros(batchsize, dtype=torch.bool, device=seqs.device)
+
+    features = np.asarray(prior["features"])
+    if features.ndim != 3 or features.shape[-1] < 4:
+        return torch.zeros(batchsize, dtype=torch.bool, device=seqs.device)
+
+    h, w, _ = features.shape
+    points = seqs[:, -1, :2].detach().cpu().numpy()
+    lat_idx = np.clip((points[:, 0] * h).astype(np.int64), 0, h - 1)
+    lon_idx = np.clip((points[:, 1] * w).astype(np.int64), 0, w - 1)
+    cell_features = features[lat_idx, lon_idx]
+
+    complex_np = (
+        (cell_features[:, 1] >= turn_threshold)
+        | (cell_features[:, 2] >= branch_threshold)
+        | (cell_features[:, 3] >= entropy_threshold)
+    )
+    return torch.as_tensor(complex_np, dtype=torch.bool, device=seqs.device)
+
+
+def _dynamic_qwen_rollout_gate_mask(
+        seqs,
+        prior,
+        config,
+        initial_len,
+        turn_threshold,
+        branch_threshold,
+        entropy_threshold,
+        gate_min_pred_points,
+        gate_min_complex_points,
+        gate_min_turn_points,
+        gate_turn_angle_deg):
+    """Decide which rollout samples are complex enough to deserve Qwen refresh."""
+    batchsize = seqs.size(0)
+    initial_len = int(initial_len)
+    pred_len = max(0, seqs.size(1) - initial_len)
+    if pred_len < int(gate_min_pred_points):
+        return torch.zeros(batchsize, dtype=torch.bool, device=seqs.device)
+
+    seq_np = seqs.detach().cpu().numpy()
+    complex_count = np.zeros((batchsize,), dtype=np.int64)
+    if prior is not None and "features" in prior:
+        features = np.asarray(prior["features"])
+        if features.ndim == 3 and features.shape[-1] >= 4 and pred_len > 0:
+            h, w, _ = features.shape
+            points = seq_np[:, initial_len:, :2]
+            lat_idx = np.clip((points[..., 0] * h).astype(np.int64), 0, h - 1)
+            lon_idx = np.clip((points[..., 1] * w).astype(np.int64), 0, w - 1)
+            cell_features = features[lat_idx, lon_idx]
+            complex_cells = (
+                (cell_features[..., 1] >= turn_threshold)
+                | (cell_features[..., 2] >= branch_threshold)
+                | (cell_features[..., 3] >= entropy_threshold)
+            )
+            complex_count = complex_cells.sum(axis=1)
+
+    turn_count = np.zeros((batchsize,), dtype=np.int64)
+    start = max(0, initial_len - 1)
+    traj = seq_np[:, start:, :2]
+    if traj.shape[1] >= 3:
+        if all(hasattr(config, name) for name in ("lat_min", "lat_max", "lon_min", "lon_max")):
+            import map_prior
+
+            lat = config.lat_min + traj[..., 0] * (config.lat_max - config.lat_min)
+            lon = config.lon_min + traj[..., 1] * (config.lon_max - config.lon_min)
+            headings = map_prior.bearing_deg(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
+            diffs = np.abs(map_prior.circular_signed_diff_deg(headings[:, 1:], headings[:, :-1]))
+        else:
+            delta = np.diff(traj, axis=1)
+            headings = (np.degrees(np.arctan2(delta[..., 1], delta[..., 0])) + 360.0) % 360.0
+            diffs = np.abs((headings[:, 1:] - headings[:, :-1] + 180.0) % 360.0 - 180.0)
+        turn_count = (diffs >= float(gate_turn_angle_deg)).sum(axis=1)
+
+    gate_np = (
+        (complex_count >= int(gate_min_complex_points))
+        | (turn_count >= int(gate_min_turn_points))
+    )
+    return torch.as_tensor(gate_np, dtype=torch.bool, device=seqs.device)
+
+
+def _dynamic_qwen_latest_turn_mask(
+        seqs,
+        config,
+        initial_len,
+        gate_min_pred_points,
+        event_turn_angle_deg,
+        event_window):
+    """Return samples whose latest predicted segment contains a sharp turn."""
+    batchsize = seqs.size(0)
+    initial_len = int(initial_len)
+    pred_len = max(0, seqs.size(1) - initial_len)
+    if pred_len < int(gate_min_pred_points):
+        return torch.zeros(batchsize, dtype=torch.bool, device=seqs.device)
+
+    seq_np = seqs.detach().cpu().numpy()
+    start = max(0, initial_len - 1)
+    traj = seq_np[:, start:, :2]
+    if traj.shape[1] < 3:
+        return torch.zeros(batchsize, dtype=torch.bool, device=seqs.device)
+
+    if all(hasattr(config, name) for name in ("lat_min", "lat_max", "lon_min", "lon_max")):
+        import map_prior
+
+        lat = config.lat_min + traj[..., 0] * (config.lat_max - config.lat_min)
+        lon = config.lon_min + traj[..., 1] * (config.lon_max - config.lon_min)
+        headings = map_prior.bearing_deg(lat[:, :-1], lon[:, :-1], lat[:, 1:], lon[:, 1:])
+        diffs = np.abs(map_prior.circular_signed_diff_deg(headings[:, 1:], headings[:, :-1]))
+    else:
+        delta = np.diff(traj, axis=1)
+        headings = (np.degrees(np.arctan2(delta[..., 1], delta[..., 0])) + 360.0) % 360.0
+        diffs = np.abs((headings[:, 1:] - headings[:, :-1] + 180.0) % 360.0 - 180.0)
+
+    if diffs.shape[1] == 0:
+        return torch.zeros(batchsize, dtype=torch.bool, device=seqs.device)
+
+    window = max(1, int(event_window))
+    recent_diffs = diffs[:, -window:]
+    event_np = (recent_diffs >= float(event_turn_angle_deg)).any(axis=1)
+    return torch.as_tensor(event_np, dtype=torch.bool, device=seqs.device)
+
+
+def _maybe_update_dynamic_qwen(
+        model,
+        seqs,
+        pred_step,
+        updates_done,
+        qwen_vec,
+        qwen_mask,
+        qwen_dynamic_encoder,
+        qwen_dynamic_config,
+        qwen_dynamic_prior,
+        qwen_dynamic_update_interval,
+        qwen_dynamic_min_pred_step,
+        qwen_dynamic_max_updates,
+        qwen_dynamic_turn_threshold,
+        qwen_dynamic_branch_threshold,
+        qwen_dynamic_entropy_threshold,
+        qwen_dynamic_batch_size,
+        qwen_dynamic_max_length,
+        qwen_dynamic_show_progress,
+        qwen_dynamic_complexity_gate,
+        qwen_dynamic_gate_interval_only,
+        qwen_dynamic_initial_len,
+        qwen_dynamic_gate_min_pred_points,
+        qwen_dynamic_gate_min_complex_points,
+        qwen_dynamic_gate_min_turn_points,
+        qwen_dynamic_gate_turn_angle_deg,
+        qwen_dynamic_total_steps,
+        qwen_dynamic_skip_last_steps,
+        qwen_dynamic_event_trigger,
+        qwen_dynamic_event_turn_angle_deg,
+        qwen_dynamic_event_window):
+    """Optionally refresh Qwen vectors from the current generated rollout."""
+    if qwen_dynamic_encoder is None:
+        return qwen_vec, qwen_mask, updates_done
+    if not getattr(model, "use_qwen_semantic_encoder", False):
+        return qwen_vec, qwen_mask, updates_done
+    if qwen_dynamic_config is None:
+        return qwen_vec, qwen_mask, updates_done
+    if pred_step < qwen_dynamic_min_pred_step:
+        return qwen_vec, qwen_mask, updates_done
+    if (
+        qwen_dynamic_total_steps > 0
+        and qwen_dynamic_skip_last_steps > 0
+        and (qwen_dynamic_total_steps - pred_step) < qwen_dynamic_skip_last_steps
+    ):
+        return qwen_vec, qwen_mask, updates_done
+
+    batchsize = seqs.size(0)
+    if not torch.is_tensor(updates_done):
+        updates_done = torch.full(
+            (batchsize,),
+            int(updates_done),
+            dtype=torch.long,
+            device=seqs.device,
+        )
+    else:
+        updates_done = updates_done.to(device=seqs.device, dtype=torch.long).view(-1)
+    if qwen_dynamic_max_updates >= 0 and bool((updates_done >= qwen_dynamic_max_updates).all().item()):
+        return qwen_vec, qwen_mask, updates_done
+
+    interval_trigger = (
+        qwen_dynamic_update_interval > 0
+        and pred_step % qwen_dynamic_update_interval == 0
+    )
+    current_complex_mask = _dynamic_qwen_complex_mask(
+        seqs,
+        qwen_dynamic_prior,
+        qwen_dynamic_turn_threshold,
+        qwen_dynamic_branch_threshold,
+        qwen_dynamic_entropy_threshold,
+    )
+    if bool(qwen_dynamic_complexity_gate):
+        if bool(qwen_dynamic_gate_interval_only) and not interval_trigger:
+            return qwen_vec, qwen_mask, updates_done
+        rollout_gate_mask = _dynamic_qwen_rollout_gate_mask(
+            seqs,
+            qwen_dynamic_prior,
+            qwen_dynamic_config,
+            qwen_dynamic_initial_len,
+            qwen_dynamic_turn_threshold,
+            qwen_dynamic_branch_threshold,
+            qwen_dynamic_entropy_threshold,
+            qwen_dynamic_gate_min_pred_points,
+            qwen_dynamic_gate_min_complex_points,
+            qwen_dynamic_gate_min_turn_points,
+            qwen_dynamic_gate_turn_angle_deg,
+        )
+        if bool(qwen_dynamic_event_trigger):
+            latest_turn_mask = _dynamic_qwen_latest_turn_mask(
+                seqs,
+                qwen_dynamic_config,
+                qwen_dynamic_initial_len,
+                qwen_dynamic_gate_min_pred_points,
+                qwen_dynamic_event_turn_angle_deg,
+                qwen_dynamic_event_window,
+            )
+            event_mask = latest_turn_mask | current_complex_mask
+            interval_mask = rollout_gate_mask if interval_trigger else torch.zeros_like(rollout_gate_mask)
+            update_mask = (event_mask & rollout_gate_mask) | interval_mask
+        else:
+            update_mask = rollout_gate_mask if interval_trigger else (current_complex_mask & rollout_gate_mask)
+    elif interval_trigger:
+        update_mask = torch.ones(batchsize, dtype=torch.bool, device=seqs.device)
+    else:
+        update_mask = current_complex_mask
+    if qwen_dynamic_max_updates >= 0:
+        update_mask = update_mask & (updates_done < qwen_dynamic_max_updates)
+    if not bool(update_mask.any().item()):
+        return qwen_vec, qwen_mask, updates_done
+
+    update_idxs = torch.nonzero(update_mask, as_tuple=False).view(-1)
+    seqs_for_qwen = seqs[update_idxs].detach().cpu().numpy()
+    qwen_np = qwen_dynamic_encoder.encode_sequences(
+        seqs_for_qwen,
+        qwen_dynamic_config,
+        prior=qwen_dynamic_prior,
+        batch_size=max(1, int(qwen_dynamic_batch_size)),
+        max_length=int(qwen_dynamic_max_length),
+        show_progress=bool(qwen_dynamic_show_progress),
+        desc=f"Qwen dynamic step {pred_step} (n={int(update_idxs.numel())}/{batchsize})",
+    )
+    qwen_new = torch.as_tensor(qwen_np, dtype=torch.float32, device=seqs.device)
+
+    if qwen_vec is None:
+        qwen_vec = torch.zeros(
+            batchsize,
+            qwen_new.size(-1),
+            dtype=qwen_new.dtype,
+            device=seqs.device,
+        )
+    else:
+        qwen_vec = qwen_vec.to(device=seqs.device).clone()
+    qwen_vec[update_idxs] = qwen_new
+
+    if qwen_mask is None:
+        qwen_mask = torch.zeros(batchsize, dtype=qwen_new.dtype, device=seqs.device)
+    else:
+        qwen_mask = qwen_mask.to(device=seqs.device, dtype=qwen_new.dtype).view(-1).clone()
+    qwen_mask[update_idxs] = 1.0
+
+    updates_done = updates_done.clone()
+    updates_done[update_idxs] += 1
+    return qwen_vec, qwen_mask, updates_done
+
+
 @torch.no_grad()
 def sample(model,
            seqs,
@@ -47,18 +317,54 @@ def sample(model,
            r_vicinity=20,
            top_k=None,
            qwen_vec=None,
-           qwen_mask=None):
+           qwen_mask=None,
+           qwen_dynamic_encoder=None,
+           qwen_dynamic_config=None,
+           qwen_dynamic_prior=None,
+           qwen_dynamic_update_interval=6,
+           qwen_dynamic_min_pred_step=3,
+           qwen_dynamic_max_updates=4,
+           qwen_dynamic_turn_threshold=0.35,
+           qwen_dynamic_branch_threshold=0.25,
+           qwen_dynamic_entropy_threshold=0.75,
+           qwen_dynamic_batch_size=1,
+           qwen_dynamic_max_length=1024,
+           qwen_dynamic_show_progress=False,
+           qwen_dynamic_complexity_gate=False,
+           qwen_dynamic_gate_interval_only=False,
+           qwen_dynamic_gate_min_pred_points=4,
+           qwen_dynamic_gate_min_complex_points=2,
+           qwen_dynamic_gate_min_turn_points=2,
+           qwen_dynamic_gate_turn_angle_deg=18.0,
+           qwen_dynamic_skip_last_steps=0,
+           qwen_dynamic_event_trigger=False,
+           qwen_dynamic_event_turn_angle_deg=30.0,
+           qwen_dynamic_event_window=1,
+           return_refined=False):
     """
     Take a conditoning sequence of AIS observations seq and predict the next observation,
     feed the predictions back into the model each time. 
     """
     max_seqlen = model.get_max_seqlen()
     model.eval()
+    dynamic_updates = torch.zeros(seqs.size(0), dtype=torch.long, device=seqs.device)
+    dynamic_initial_len = seqs.size(1)
+    refined_seqs = seqs.clone()
     for k in range(steps):
         seqs_cond = seqs if seqs.size(1) <= max_seqlen else seqs[:, -max_seqlen:]  # crop context if needed
 
         # logits.shape: (batch_size, seq_len, data_size)
-        logits, _ = model(seqs_cond, qwen_vec=qwen_vec, qwen_mask=qwen_mask)
+        use_refined = bool(return_refined and getattr(model, "use_grid_residual", False))
+        if use_refined:
+            logits, _, grid_residual = model(
+                seqs_cond,
+                qwen_vec=qwen_vec,
+                qwen_mask=qwen_mask,
+                return_residual=True,
+            )
+        else:
+            logits, _ = model(seqs_cond, qwen_vec=qwen_vec, qwen_mask=qwen_mask)
+            grid_residual = None
         d2inf_pred = torch.zeros((logits.shape[0], 4)).to(seqs.device) + 0.5
 
         # pluck the logits at the final step and scale by temperature
@@ -101,11 +407,58 @@ def sample(model,
         ix = torch.cat((lat_ix, lon_ix, sog_ix, cog_ix), dim=-1)
         # convert to x (range: [0,1))
         x_sample = (ix.float() + d2inf_pred) / model.att_sizes
+        x_refined = x_sample.clone()
+        if use_refined and grid_residual is not None:
+            residual = grid_residual[:, -1, :]
+            x_refined[:, 0] = torch.clamp(
+                (lat_ix.view(-1).float() + 0.5 + residual[:, 0]) / float(model.lat_size),
+                0.0,
+                0.9999,
+            )
+            x_refined[:, 1] = torch.clamp(
+                (lon_ix.view(-1).float() + 0.5 + residual[:, 1]) / float(model.lon_size),
+                0.0,
+                0.9999,
+            )
 
         # append to the sequence and continue
         seqs = torch.cat((seqs, x_sample.unsqueeze(1)), dim=1)
+        refined_seqs = torch.cat((refined_seqs, x_refined.unsqueeze(1)), dim=1)
+        qwen_update_seqs = refined_seqs if use_refined else seqs
+        qwen_vec, qwen_mask, dynamic_updates = _maybe_update_dynamic_qwen(
+            model=model,
+            seqs=qwen_update_seqs,
+            pred_step=k + 1,
+            updates_done=dynamic_updates,
+            qwen_vec=qwen_vec,
+            qwen_mask=qwen_mask,
+            qwen_dynamic_encoder=qwen_dynamic_encoder,
+            qwen_dynamic_config=qwen_dynamic_config,
+            qwen_dynamic_prior=qwen_dynamic_prior,
+            qwen_dynamic_update_interval=int(qwen_dynamic_update_interval),
+            qwen_dynamic_min_pred_step=int(qwen_dynamic_min_pred_step),
+            qwen_dynamic_max_updates=int(qwen_dynamic_max_updates),
+            qwen_dynamic_turn_threshold=float(qwen_dynamic_turn_threshold),
+            qwen_dynamic_branch_threshold=float(qwen_dynamic_branch_threshold),
+            qwen_dynamic_entropy_threshold=float(qwen_dynamic_entropy_threshold),
+            qwen_dynamic_batch_size=int(qwen_dynamic_batch_size),
+            qwen_dynamic_max_length=int(qwen_dynamic_max_length),
+            qwen_dynamic_show_progress=bool(qwen_dynamic_show_progress),
+            qwen_dynamic_complexity_gate=bool(qwen_dynamic_complexity_gate),
+            qwen_dynamic_gate_interval_only=bool(qwen_dynamic_gate_interval_only),
+            qwen_dynamic_initial_len=dynamic_initial_len,
+            qwen_dynamic_gate_min_pred_points=int(qwen_dynamic_gate_min_pred_points),
+            qwen_dynamic_gate_min_complex_points=int(qwen_dynamic_gate_min_complex_points),
+            qwen_dynamic_gate_min_turn_points=int(qwen_dynamic_gate_min_turn_points),
+            qwen_dynamic_gate_turn_angle_deg=float(qwen_dynamic_gate_turn_angle_deg),
+            qwen_dynamic_total_steps=int(steps),
+            qwen_dynamic_skip_last_steps=int(qwen_dynamic_skip_last_steps),
+            qwen_dynamic_event_trigger=bool(qwen_dynamic_event_trigger),
+            qwen_dynamic_event_turn_angle_deg=float(qwen_dynamic_event_turn_angle_deg),
+            qwen_dynamic_event_window=int(qwen_dynamic_event_window),
+        )
 
-    return seqs
+    return refined_seqs if bool(return_refined) else seqs
 
 
 def unpack_batch(batch):
@@ -350,7 +703,8 @@ class Trainer:
                            r_vicinity=self.config.r_vicinity,
                            top_k=self.config.top_k,
                            qwen_vec=qwen_vecs,
-                           qwen_mask=qwen_masks)
+                           qwen_mask=qwen_masks,
+                           return_refined=getattr(self.config, "grid_residual_use_for_eval", False))
 
             img_path = os.path.join(self.savedir, f'epoch_{epoch + 1:03d}.jpg')
             plt.figure(figsize=(9, 6), dpi=150)

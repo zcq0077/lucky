@@ -221,6 +221,20 @@ class TrAISformer(nn.Module):
             self.qwen_projector = None
             self.qwen_gate = None
             self.captain_selector = None
+
+        self.use_grid_residual = getattr(config, "use_grid_residual", False)
+        self.grid_residual_loss_w = float(getattr(config, "grid_residual_loss_w", 0.0))
+        self.grid_residual_max_abs_cell = float(getattr(config, "grid_residual_max_abs_cell", 0.5))
+        if self.use_grid_residual:
+            self.grid_residual_head = nn.Sequential(
+                nn.LayerNorm(config.n_embd),
+                nn.Linear(config.n_embd, max(64, config.n_embd // 2)),
+                nn.GELU(),
+                nn.Dropout(getattr(config, "grid_residual_pdrop", 0.0)),
+                nn.Linear(max(64, config.n_embd // 2), 2),
+            )
+        else:
+            self.grid_residual_head = None
         
         # transformer
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
@@ -397,6 +411,27 @@ class TrAISformer(nn.Module):
         lon_logits = lon_logits + self.qwen_bias_w * lon_bias
         return torch.cat((lat_logits, lon_logits, sog_logits, cog_logits), dim=-1)
 
+    def predict_grid_residual(self, fea):
+        if self.grid_residual_head is None:
+            return None
+        residual = torch.tanh(self.grid_residual_head(fea))
+        return self.grid_residual_max_abs_cell * residual
+
+    def make_grid_residual_targets(self, targets_uniform, targets_real):
+        """Return normalized sub-grid offsets for lat/lon targets.
+
+        Each offset is measured in cell units relative to the target cell center,
+        so values are roughly in [-0.5, 0.5].
+        """
+        lat_target = targets_real[..., 0] * float(self.lat_size) - (targets_uniform[..., 0].float() + 0.5)
+        lon_target = targets_real[..., 1] * float(self.lon_size) - (targets_uniform[..., 1].float() + 0.5)
+        target = torch.stack((lat_target, lon_target), dim=-1)
+        return torch.clamp(
+            target,
+            -self.grid_residual_max_abs_cell,
+            self.grid_residual_max_abs_cell,
+        )
+
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=0.02)
@@ -479,7 +514,15 @@ class TrAISformer(nn.Module):
             return idxs, idxs_uniform
     
     
-    def forward(self, x, masks = None, with_targets=False, return_loss_tuple=False, qwen_vec=None, qwen_mask=None):
+    def forward(
+            self,
+            x,
+            masks=None,
+            with_targets=False,
+            return_loss_tuple=False,
+            qwen_vec=None,
+            qwen_mask=None,
+            return_residual=False):
         """
         Args:
             x: a Tensor of size (batchsize, seqlen, 4). x has been truncated 
@@ -535,6 +578,7 @@ class TrAISformer(nn.Module):
         fea = self.ln_f(fea) # (bs, seqlen, n_embd)
         logits = self.head(fea) # (bs, seqlen, full_size) or (bs, seqlen, n_embd)
         logits = self._apply_qwen_logit_bias(logits, inputs_real, qwen_vec, qwen_mask)
+        grid_residual = self.predict_grid_residual(fea)
         
         lat_logits, lon_logits, sog_logits, cog_logits =\
             torch.split(logits, (self.lat_size, self.lon_size, self.sog_size, self.cog_size), dim=-1)
@@ -601,6 +645,23 @@ class TrAISformer(nn.Module):
         
             loss = loss.mean()
 
+            if (
+                self.use_grid_residual
+                and self.grid_residual_loss_w > 0
+                and grid_residual is not None
+            ):
+                residual_targets = self.make_grid_residual_targets(targets_uniform, targets_real)
+                residual_loss = F.smooth_l1_loss(
+                    grid_residual,
+                    residual_targets,
+                    reduction="none",
+                ).mean(dim=-1)
+                if masks is not None:
+                    residual_loss = (residual_loss * masks).sum() / masks.sum().clamp_min(1.0)
+                else:
+                    residual_loss = residual_loss.mean()
+                loss = loss + self.grid_residual_loss_w * residual_loss
+
             if self.use_turn_intent_head and self.turn_intent_loss_w > 0:
                 turn_logits = self.turn_head(fea)
                 turn_labels, turn_mask = self.make_turn_labels(x, seqlen, masks=masks)
@@ -614,7 +675,11 @@ class TrAISformer(nn.Module):
                 loss = loss + self.turn_intent_loss_w * turn_loss
         
         if return_loss_tuple:
+            if return_residual:
+                return logits, loss, loss_tuple, grid_residual
             return logits, loss, loss_tuple
         else:
+            if return_residual:
+                return logits, loss, grid_residual
             return logits, loss
         

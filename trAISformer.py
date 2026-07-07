@@ -27,6 +27,9 @@ import matplotlib.pyplot as plt
 import os
 import sys
 import pickle
+import json
+import csv
+from datetime import datetime
 from tqdm import tqdm
 import math
 import logging
@@ -55,6 +58,146 @@ else:
 # make deterministic
 utils.set_seed(42)
 torch.pi = torch.acos(torch.zeros(1)).item() * 2
+
+
+def _json_safe_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    return str(value)
+
+
+def _public_config_dict(config):
+    items = {}
+    for name in dir(config):
+        if name.startswith("_") or name in ("tb_writer",):
+            continue
+        value = getattr(config, name)
+        if callable(value):
+            continue
+        items[name] = _json_safe_value(value)
+    return items
+
+
+def save_experiment_snapshot(config, metrics=None):
+    """Save a readable config/metric snapshot for experiment comparison."""
+    os.makedirs(config.savedir, exist_ok=True)
+    config_items = _public_config_dict(config)
+    payload = {
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "savedir": config.savedir,
+        "filename": getattr(config, "filename", ""),
+        "metrics": metrics or {},
+        "config": config_items,
+    }
+
+    json_path = os.path.join(config.savedir, "config_snapshot.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    key_names = [
+        "retrain",
+        "use_map_prior",
+        "map_emb_w",
+        "use_turn_intent_head",
+        "turn_intent_loss_w",
+        "use_qwen_semantic_encoder",
+        "qwen_model_path",
+        "qwen_cache_dir",
+        "qwen_hidden_size",
+        "qwen_emb_w",
+        "qwen_bias_w",
+        "qwen_emb_pdrop",
+        "qwen_dynamic_inference",
+        "qwen_dynamic_inference_pred_samples",
+        "qwen_dynamic_visualize",
+        "qwen_dynamic_visualize_pred_samples",
+        "eval_n_samples",
+        "use_grid_residual",
+        "grid_residual_loss_w",
+        "grid_residual_max_abs_cell",
+        "grid_residual_use_for_eval",
+        "learning_rate",
+        "batch_size",
+        "max_epochs",
+        "early_stopping",
+        "early_stop_patience",
+    ]
+    md_path = os.path.join(config.savedir, "config_snapshot.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("# Experiment Snapshot\n\n")
+        f.write(f"- created_at: {payload['created_at']}\n")
+        f.write(f"- savedir: `{config.savedir}`\n")
+        f.write(f"- filename: `{getattr(config, 'filename', '')}`\n\n")
+        f.write("## Key Settings\n\n")
+        for name in key_names:
+            if name in config_items:
+                f.write(f"- {name}: `{config_items[name]}`\n")
+        if metrics:
+            f.write("\n## Test Metrics\n\n")
+            for name, value in metrics.items():
+                f.write(f"- {name}: `{value}`\n")
+        f.write("\n## Full Config\n\n")
+        for name in sorted(config_items):
+            f.write(f"- {name}: `{config_items[name]}`\n")
+
+
+def append_experiment_index(config, metrics):
+    """Append one row to results/_experiment_index.csv for quick comparison."""
+    os.makedirs("./results", exist_ok=True)
+    index_path = os.path.join("./results", "_experiment_index.csv")
+    fieldnames = [
+        "created_at",
+        "filename",
+        "savedir",
+        "err_1h_km",
+        "err_2h_km",
+        "err_3h_km",
+        "err_4h_km",
+        "mean_err_km",
+        "map_emb_w",
+        "turn_intent_loss_w",
+        "qwen_emb_w",
+        "qwen_bias_w",
+        "qwen_emb_pdrop",
+        "qwen_hidden_size",
+        "qwen_dynamic_inference",
+        "qwen_dynamic_inference_pred_samples",
+        "qwen_dynamic_visualize",
+        "qwen_dynamic_visualize_pred_samples",
+        "eval_n_samples",
+        "use_grid_residual",
+        "grid_residual_loss_w",
+        "grid_residual_max_abs_cell",
+        "grid_residual_use_for_eval",
+        "learning_rate",
+        "batch_size",
+        "max_epochs",
+        "early_stopping",
+    ]
+    row = {
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "filename": getattr(config, "filename", ""),
+        "savedir": config.savedir,
+    }
+    for name in fieldnames:
+        if name in row:
+            continue
+        if name in metrics:
+            row[name] = metrics[name]
+        else:
+            row[name] = _json_safe_value(getattr(config, name, ""))
+
+    write_header = not os.path.exists(index_path)
+    with open(index_path, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"======= Updated experiment index: {index_path}")
 
 
 def _to_lon_lat_degrees(seqs, model):
@@ -114,13 +257,106 @@ def load_qwen_cache(cf, phase, n_items):
     return vectors, masks
 
 
-def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seqlen, savedir):
+def load_qwen_dynamic_encoder(cf, prior=None):
+    """Load dynamic semantic encoder only when dynamic inference is explicitly requested."""
+    wants_dynamic = (
+        bool(getattr(cf, "qwen_dynamic_inference", False))
+        or bool(getattr(cf, "qwen_dynamic_visualize", False))
+    )
+    if not wants_dynamic:
+        return None
+    if not getattr(cf, "use_qwen_semantic_encoder", False):
+        print("======= Qwen dynamic requested but use_qwen_semantic_encoder=False; skip dynamic Qwen.")
+        return None
+    if prior is None:
+        print("======= Qwen dynamic will run without map context; interval updates only.")
+
+    if bool(getattr(cf, "use_captain_student_dynamic", False)):
+        from captain_student import CaptainStudentDynamicEncoder
+
+        ckpt_path = getattr(cf, "captain_student_ckpt_path", "./captain_student/captain_student.pt")
+        print(f"======= Loading Captain Student dynamic encoder from: {ckpt_path} ({cf.device})")
+        encoder = CaptainStudentDynamicEncoder(
+            ckpt_path,
+            config=cf,
+            prior=prior,
+            device=cf.device,
+        )
+        expected_hidden = int(getattr(cf, "qwen_hidden_size", encoder.hidden_size))
+        if encoder.hidden_size != expected_hidden:
+            raise ValueError(
+                f"Captain Student output_dim={encoder.hidden_size}, "
+                f"but qwen_hidden_size={expected_hidden}. "
+                "Regenerate teacher/static cache and retrain the student with the same Qwen model."
+            )
+        return encoder
+
+    from qwen_semantic_encoder import QwenSemanticEncoder
+
+    device = getattr(cf, "qwen_dynamic_device", "cuda")
+    print(f"======= Loading Qwen dynamic encoder from: {cf.qwen_model_path} ({device})")
+    return QwenSemanticEncoder(
+        cf.qwen_model_path,
+        device=device,
+        freeze=True,
+    )
+
+
+def _qwen_dynamic_value(cf, scope, name, default):
+    scoped_name = f"qwen_dynamic_{scope}_{name}" if scope else None
+    if scoped_name and hasattr(cf, scoped_name):
+        return getattr(cf, scoped_name)
+    return getattr(cf, f"qwen_dynamic_{name}", default)
+
+
+def qwen_dynamic_kwargs(cf, encoder, prior, enabled, scope=None):
+    if not enabled or encoder is None:
+        return {}
+    scope = scope or ""
+    return {
+        "qwen_dynamic_encoder": encoder,
+        "qwen_dynamic_config": cf,
+        "qwen_dynamic_prior": prior,
+        "qwen_dynamic_update_interval": _qwen_dynamic_value(cf, scope, "update_interval", 6),
+        "qwen_dynamic_min_pred_step": _qwen_dynamic_value(cf, scope, "min_pred_step", 3),
+        "qwen_dynamic_max_updates": _qwen_dynamic_value(cf, scope, "max_updates", 4),
+        "qwen_dynamic_turn_threshold": _qwen_dynamic_value(cf, scope, "turn_threshold", 0.35),
+        "qwen_dynamic_branch_threshold": _qwen_dynamic_value(cf, scope, "branch_threshold", 0.25),
+        "qwen_dynamic_entropy_threshold": _qwen_dynamic_value(cf, scope, "entropy_threshold", 0.75),
+        "qwen_dynamic_batch_size": _qwen_dynamic_value(cf, scope, "batch_size", 1),
+        "qwen_dynamic_max_length": _qwen_dynamic_value(cf, scope, "max_length", 1024),
+        "qwen_dynamic_show_progress": _qwen_dynamic_value(cf, scope, "show_progress", False),
+        "qwen_dynamic_complexity_gate": _qwen_dynamic_value(cf, scope, "complexity_gate", False),
+        "qwen_dynamic_gate_interval_only": _qwen_dynamic_value(cf, scope, "gate_interval_only", False),
+        "qwen_dynamic_gate_min_pred_points": _qwen_dynamic_value(cf, scope, "gate_min_pred_points", 4),
+        "qwen_dynamic_gate_min_complex_points": _qwen_dynamic_value(cf, scope, "gate_min_complex_points", 2),
+        "qwen_dynamic_gate_min_turn_points": _qwen_dynamic_value(cf, scope, "gate_min_turn_points", 2),
+        "qwen_dynamic_gate_turn_angle_deg": _qwen_dynamic_value(cf, scope, "gate_turn_angle_deg", 18.0),
+        "qwen_dynamic_skip_last_steps": _qwen_dynamic_value(cf, scope, "skip_last_steps", 0),
+        "qwen_dynamic_event_trigger": _qwen_dynamic_value(cf, scope, "event_trigger", False),
+        "qwen_dynamic_event_turn_angle_deg": _qwen_dynamic_value(cf, scope, "event_turn_angle_deg", 30.0),
+        "qwen_dynamic_event_window": _qwen_dynamic_value(cf, scope, "event_window", 1),
+    }
+
+
+def plot_test_trajectory_examples(
+        model,
+        test_dataset,
+        cf,
+        init_seqlen,
+        max_seqlen,
+        savedir,
+        qwen_dynamic_encoder=None,
+        qwen_dynamic_prior=None):
     """Plot history, ground truth, and sampled predictions for test trajectories."""
     if not getattr(cf, "test_visualize", True):
         return
 
     n_examples = int(getattr(cf, "test_visualize_n", 10))
     n_pred_samples = int(getattr(cf, "test_visualize_pred_samples", getattr(cf, "n_samples", 16)))
+    dynamic_visualize = bool(getattr(cf, "qwen_dynamic_visualize", False)) and qwen_dynamic_encoder is not None
+    if dynamic_visualize:
+        n_pred_samples = int(getattr(cf, "qwen_dynamic_visualize_pred_samples", n_pred_samples))
     rng = np.random.default_rng(int(getattr(cf, "test_visualize_seed", 42)))
 
     seqlens_all = np.array([
@@ -160,8 +396,24 @@ def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seql
 
     pred_samples = []
     model.eval()
+    dynamic_kwargs = qwen_dynamic_kwargs(
+        cf,
+        qwen_dynamic_encoder,
+        qwen_dynamic_prior,
+        dynamic_visualize,
+        scope="visualize",
+    )
+    if dynamic_visualize:
+        print(
+            "======= Dynamic Qwen visualization: "
+            f"{n_examples} trajectories x {n_pred_samples} samples. "
+            "This is inference-time trajectory generation, not image post-processing."
+        )
     with torch.no_grad():
-        for _ in range(max(1, n_pred_samples)):
+        sample_iter = range(max(1, n_pred_samples))
+        if dynamic_visualize:
+            sample_iter = tqdm(sample_iter, desc="Dynamic Qwen visual samples")
+        for _ in sample_iter:
             preds = trainers.sample(
                 model,
                 seqs_init,
@@ -173,6 +425,8 @@ def plot_test_trajectory_examples(model, test_dataset, cf, init_seqlen, max_seql
                 top_k=cf.top_k,
                 qwen_vec=qwen_vecs,
                 qwen_mask=qwen_masks,
+                return_refined=getattr(cf, "grid_residual_use_for_eval", False),
+                **dynamic_kwargs,
             )
             pred_samples.append(preds.detach().cpu().numpy())
 
@@ -269,6 +523,8 @@ if __name__ == "__main__":
     else:
         print('======= Directory to store trained models: ' + cf.savedir)
     utils.new_log(cf.savedir, "log")
+    save_experiment_snapshot(cf)
+    print(f"======= Saved experiment config snapshot: {os.path.join(cf.savedir, 'config_snapshot.md')}")
 
     ## Data
     # ===============================
@@ -329,6 +585,7 @@ if __name__ == "__main__":
     ## Model
     # ===============================
     model = models.TrAISformer(cf, partition_model=None)
+    prior = None
     if getattr(cf, "use_map_prior", False):
         import map_prior
 
@@ -362,8 +619,53 @@ if __name__ == "__main__":
     max_seqlen = init_seqlen + 6 * 4
 
     model.eval()
+    qwen_dynamic_encoder = None
+    if bool(getattr(cf, "qwen_dynamic_inference", False)):
+        qwen_dynamic_encoder = load_qwen_dynamic_encoder(cf, prior)
+    dynamic_eval_enabled = bool(getattr(cf, "qwen_dynamic_inference", False))
+    dynamic_eval_kwargs = qwen_dynamic_kwargs(
+        cf,
+        qwen_dynamic_encoder,
+        prior,
+        dynamic_eval_enabled,
+        scope="inference",
+    )
+    eval_static_samples = 0
+    eval_dynamic_samples = int(getattr(cf, "n_samples", 16))
+    if dynamic_eval_enabled:
+        eval_static_samples = int(getattr(cf, "qwen_dynamic_inference_static_samples", 0))
+        eval_dynamic_samples = int(getattr(cf, "qwen_dynamic_inference_pred_samples", eval_dynamic_samples))
+        eval_n_samples = eval_static_samples + eval_dynamic_samples
+        if eval_static_samples > 0:
+            sample_text = f"mixed best-of-{eval_n_samples} ({eval_static_samples} static + {eval_dynamic_samples} dynamic-capable)"
+        else:
+            sample_text = f"conditional dynamic best-of-{eval_n_samples}"
+        print(
+            "======= Dynamic Qwen evaluation uses "
+            f"{sample_text}, "
+            f"max_updates={getattr(cf, 'qwen_dynamic_inference_max_updates', getattr(cf, 'qwen_dynamic_max_updates', 4))}, "
+            f"update_interval={getattr(cf, 'qwen_dynamic_inference_update_interval', getattr(cf, 'qwen_dynamic_update_interval', 6))}, "
+            f"qwen_batch={getattr(cf, 'qwen_dynamic_inference_batch_size', getattr(cf, 'qwen_dynamic_batch_size', 1))}, "
+            f"complexity_gate={getattr(cf, 'qwen_dynamic_inference_complexity_gate', getattr(cf, 'qwen_dynamic_complexity_gate', False))}, "
+            f"interval_only={getattr(cf, 'qwen_dynamic_inference_gate_interval_only', getattr(cf, 'qwen_dynamic_gate_interval_only', False))}, "
+            f"event_trigger={getattr(cf, 'qwen_dynamic_inference_event_trigger', getattr(cf, 'qwen_dynamic_event_trigger', False))}, "
+            f"skip_last={getattr(cf, 'qwen_dynamic_inference_skip_last_steps', getattr(cf, 'qwen_dynamic_skip_last_steps', 0))}, "
+            f"student_dynamic={getattr(cf, 'use_captain_student_dynamic', False)}, "
+            f"turn_gate={getattr(cf, 'qwen_dynamic_gate_min_turn_points', 2)}x"
+            f"{getattr(cf, 'qwen_dynamic_gate_turn_angle_deg', 18.0)}deg."
+        )
+    else:
+        eval_n_samples = eval_dynamic_samples
+    cf.eval_n_samples = eval_n_samples
     l_min_errors, l_mean_errors, l_masks = [], [], []
-    pbar = tqdm(enumerate(aisdls["test"]), total=len(aisdls["test"]))
+    pbar = tqdm(
+        enumerate(aisdls["test"]),
+        total=len(aisdls["test"]),
+        desc="Test batches",
+        dynamic_ncols=True,
+        leave=True,
+        position=0,
+    )
     with torch.no_grad():
         for it, batch in pbar:
             seqs, masks, seqlens, mmsis, time_starts, qwen_vecs, qwen_masks = trainers.unpack_batch(batch)
@@ -373,8 +675,10 @@ if __name__ == "__main__":
                 qwen_vecs = qwen_vecs.to(cf.device)
                 qwen_masks = qwen_masks.to(cf.device)
             batchsize = seqs.shape[0]
-            error_ens = torch.zeros((batchsize, max_seqlen - cf.init_seqlen, cf.n_samples)).to(cf.device)
-            for i_sample in range(cf.n_samples):
+            error_ens = torch.zeros((batchsize, max_seqlen - cf.init_seqlen, eval_n_samples)).to(cf.device)
+            sample_col = 0
+            for _ in range(eval_static_samples):
+                pbar.set_postfix_str(f"sample {sample_col + 1}/{eval_n_samples}")
                 preds = trainers.sample(model,
                                         seqs_init,
                                         max_seqlen - init_seqlen,
@@ -384,12 +688,34 @@ if __name__ == "__main__":
                                         r_vicinity=cf.r_vicinity,
                                         top_k=cf.top_k,
                                         qwen_vec=qwen_vecs,
-                                        qwen_mask=qwen_masks)
+                                        qwen_mask=qwen_masks,
+                                        return_refined=getattr(cf, "grid_residual_use_for_eval", False))
                 inputs = seqs[:, :max_seqlen, :].to(cf.device)
                 input_coords = (inputs * v_ranges + v_roi_min) * torch.pi / 180
                 pred_coords = (preds * v_ranges + v_roi_min) * torch.pi / 180
                 d = utils.haversine(input_coords, pred_coords) * masks
-                error_ens[:, :, i_sample] = d[:, cf.init_seqlen:]
+                error_ens[:, :, sample_col] = d[:, cf.init_seqlen:]
+                sample_col += 1
+            for _ in range(eval_dynamic_samples):
+                pbar.set_postfix_str(f"sample {sample_col + 1}/{eval_n_samples}")
+                preds = trainers.sample(model,
+                                        seqs_init,
+                                        max_seqlen - init_seqlen,
+                                        temperature=1.0,
+                                        sample=True,
+                                        sample_mode=cf.sample_mode,
+                                        r_vicinity=cf.r_vicinity,
+                                        top_k=cf.top_k,
+                                        qwen_vec=qwen_vecs,
+                                        qwen_mask=qwen_masks,
+                                        return_refined=getattr(cf, "grid_residual_use_for_eval", False),
+                                        **dynamic_eval_kwargs)
+                inputs = seqs[:, :max_seqlen, :].to(cf.device)
+                input_coords = (inputs * v_ranges + v_roi_min) * torch.pi / 180
+                pred_coords = (preds * v_ranges + v_roi_min) * torch.pi / 180
+                d = utils.haversine(input_coords, pred_coords) * masks
+                error_ens[:, :, sample_col] = d[:, cf.init_seqlen:]
+                sample_col += 1
             # Accumulation through batches
             l_min_errors.append(error_ens.min(dim=-1))
             l_mean_errors.append(error_ens.mean(dim=-1))
@@ -400,6 +726,20 @@ if __name__ == "__main__":
     min_errors = torch.cat(l_min, dim=0) * m_masks
     pred_errors = min_errors.sum(dim=0) / m_masks.sum(dim=0)
     pred_errors = pred_errors.detach().cpu().numpy()
+    def _error_at(index):
+        index = min(int(index), len(pred_errors) - 1)
+        return round(float(pred_errors[index]), 6)
+
+    test_metrics = {
+        "err_1h_km": _error_at(6),
+        "err_2h_km": _error_at(12),
+        "err_3h_km": _error_at(18),
+        "err_4h_km": _error_at(23),
+        "mean_err_km": round(float(np.nanmean(pred_errors)), 6),
+        "eval_n_samples": int(eval_n_samples),
+    }
+    save_experiment_snapshot(cf, metrics=test_metrics)
+    append_experiment_index(cf, test_metrics)
 
     ## Plot
     # ===============================
@@ -434,6 +774,8 @@ if __name__ == "__main__":
 
     ## Test trajectory visualization
     # ===============================
+    if qwen_dynamic_encoder is None and bool(getattr(cf, "qwen_dynamic_visualize", False)):
+        qwen_dynamic_encoder = load_qwen_dynamic_encoder(cf, prior)
     plot_test_trajectory_examples(
         model,
         aisdatasets["test"],
@@ -441,6 +783,8 @@ if __name__ == "__main__":
         init_seqlen,
         max_seqlen,
         cf.savedir,
+        qwen_dynamic_encoder=qwen_dynamic_encoder,
+        qwen_dynamic_prior=prior,
     )
 
     # Yeah, done!!!

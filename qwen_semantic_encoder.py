@@ -130,6 +130,48 @@ def build_history_summary(vessel, traj_idx, config, prior):
     }
 
 
+def build_sequence_summary(seq, config, prior=None, trajectory_id=-1, mmsi=0):
+    """Build a compact summary from the current rollout sequence.
+
+    This is used by dynamic inference. The sequence may contain the real
+    history followed by points that the model has already generated.
+    """
+    max_points = int(getattr(config, "qwen_prompt_max_points", config.init_seqlen))
+    traj = np.asarray(seq[-max_points:, :4], dtype=np.float64)
+    if len(traj) < 2:
+        raise ValueError("Sequence is too short for Qwen semantic encoding.")
+
+    traj[:, :2] = np.clip(traj[:, :2], 0.0, 0.999999)
+    current = traj[-1]
+    lat, lon = _normalized_to_degrees(traj[:, :2], config)
+    headings = _bearing_series(traj, config)
+    recent_headings = headings[-5:] if len(headings) > 0 else headings
+    recent_steps = np.diff(traj[-6:, :2], axis=0) if len(traj) >= 6 else np.diff(traj[:, :2], axis=0)
+    mean_step_norm = float(np.linalg.norm(recent_steps, axis=1).mean()) if len(recent_steps) else 0.0
+    speed_values = traj[-6:, 2] if len(traj) >= 6 else traj[:, 2]
+    speed_trend = float(speed_values[-1] - speed_values[0]) if len(speed_values) > 1 else 0.0
+    map_context = query_map_context(current[:2], prior) if prior is not None else None
+
+    return {
+        "trajectory_id": int(trajectory_id),
+        "mmsi": int(mmsi),
+        "history_points": int(len(traj)),
+        "source": "dynamic_rollout",
+        "current_position": {
+            "lat": round(float(lat[-1]), 6),
+            "lon": round(float(lon[-1]), 6),
+        },
+        "current_heading_deg": round(float(headings[-1]) if len(headings) else 0.0, 2),
+        "recent_mean_heading_deg": round(float(np.mean(recent_headings)) if len(recent_headings) else 0.0, 2),
+        "recent_mean_turn_deg": round(_mean_signed_turn(recent_headings), 2),
+        "recent_mean_step_norm": round(mean_step_norm, 6),
+        "speed_trend_norm": round(speed_trend, 5),
+        "current_sog_norm": round(_safe_float(current[2]), 4),
+        "current_cog_deg_from_data": round(_safe_float(current[3]) * 360.0, 2),
+        "map_context": map_context,
+    }
+
+
 def build_semantic_prompt(summary):
     """Build a deterministic prompt. It must contain history only."""
     payload = {
@@ -198,10 +240,18 @@ class QwenSemanticEncoder:
     def hidden_size(self):
         return int(getattr(self.model.config, "hidden_size"))
 
-    def encode_prompts(self, prompts, batch_size=4, max_length=1024, desc="Qwen encoding"):
+    def encode_prompts(self, prompts, batch_size=4, max_length=1024, desc="Qwen encoding", show_progress=True):
         vectors = []
         ranges = range(0, len(prompts), batch_size)
-        for start in tqdm(ranges, total=math.ceil(len(prompts) / batch_size), desc=desc):
+        for start in tqdm(
+            ranges,
+            total=math.ceil(len(prompts) / batch_size),
+            desc=desc,
+            disable=not show_progress,
+            leave=False,
+            dynamic_ncols=True,
+            position=1,
+        ):
             chunk = prompts[start:start + batch_size]
             device = next(self.model.parameters()).device
             inputs = self.tokenizer(
@@ -223,3 +273,24 @@ class QwenSemanticEncoder:
             pooled = hidden[self.torch.arange(hidden.size(0), device=hidden.device), last_idx]
             vectors.append(pooled.detach().float().cpu().numpy())
         return np.concatenate(vectors, axis=0).astype(np.float32)
+
+    def encode_sequences(
+            self,
+            seqs,
+            config,
+            prior=None,
+            batch_size=1,
+            max_length=1024,
+            show_progress=False,
+            desc="Qwen dynamic"):
+        prompts = [
+            build_semantic_prompt(build_sequence_summary(seq, config, prior, trajectory_id=i))
+            for i, seq in enumerate(seqs)
+        ]
+        return self.encode_prompts(
+            prompts,
+            batch_size=batch_size,
+            max_length=max_length,
+            desc=desc,
+            show_progress=show_progress,
+        )
